@@ -46,6 +46,9 @@ std::uint32_t recovery_token{};
 bool runtime_stopping{}; // protected by state_mutex
 CheekyGazeSnapshotV1 snapshot{};
 std::uint64_t generation=0x8000000000000001ULL, frame{}, simulation_start{};
+// Protected by state_mutex. Keep the diagnostic rate low in the frame hook.
+std::uint32_t last_gaze_diagnostic_state{UINT32_MAX};
+ULONGLONG next_gaze_diagnostic_tick{};
 thread_local unsigned wait_depth{};
 thread_local unsigned submit_depth{};
 std::uint32_t pattern{};
@@ -74,13 +77,7 @@ void shutdown_hook() {
     std::lock_guard lock(state_mutex);
     runtime_stopping=false;
 }
-bool own_menu_allows_gaze() {
-    vr::EVRInitError error{};
-    auto* overlay = static_cast<vr::IVROverlay*>(get_interface(vr::IVROverlay_Version, &error));
-    return overlay && error == vr::VRInitError_None &&
-        cheeky::openvr_menu_allows_gaze(*overlay, GetCurrentProcessId());
-}
-void observe_frame(bool focused) {
+void observe_frame(vr::EVRCompositorError wait_result, bool pose_valid) {
     if (stopping.load()) return;
     Retired retired; // Release resources after state_mutex, outside coordinator lock order.
     std::lock_guard lock(state_mutex);
@@ -101,14 +98,25 @@ void observe_frame(bool focused) {
     snapshot.session_generation=generation;
     snapshot.swapchain_generation=generation;
     snapshot.status_flags=CHEEKY_GAZE_STATUS_LAYER_ACTIVE|CHEEKY_GAZE_STATUS_OPENVR;
-    // Our menu's laser mode consumes controller input without invalidating
-    // eye tracking. Preserve scene-focus/head-pose and sample-validity checks.
-    if (focused && (system->IsInputAvailable() || own_menu_allows_gaze()))
+    // SteamVR can route controller input elsewhere while the game still owns
+    // the scene and receives valid eye tracking. Keep input/menu state for
+    // diagnostics, but never use it to reject a scene gaze sample.
+    const bool input_available=system->IsInputAvailable();
+    vr::EVRInitError overlay_error{};
+    auto* overlay=static_cast<vr::IVROverlay*>(get_interface(vr::IVROverlay_Version,&overlay_error));
+    const bool overlay_ready=overlay && overlay_error==vr::VRInitError_None;
+    const bool dashboard_visible=overlay_ready && overlay->IsDashboardVisible();
+    const bool menu_exception=!input_available && overlay_ready && !dashboard_visible &&
+        cheeky::openvr_menu_captures_input(*overlay,GetCurrentProcessId());
+    const bool focused=cheeky::openvr_gaze_scene_focused(
+        {wait_result,pose_valid,input_available,dashboard_visible,menu_exception});
+    if (focused)
         snapshot.status_flags|=CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
     const char* runtime=system->GetRuntimeVersion();
     sprintf_s(snapshot.runtime_name,"SteamVR / OpenVR %s",runtime ? runtime : "");
     vr::HmdVector2_t ndc[2]{};
-    bool valid=!simulate && system->GetEyeTrackedFoveationCenter(&ndc[0],&ndc[1]);
+    const bool raw_gaze_valid=!simulate && system->GetEyeTrackedFoveationCenter(&ndc[0],&ndc[1]);
+    bool valid=raw_gaze_valid;
     vr::ETrackedPropertyError property_error{};
     if (valid || system->GetBoolTrackedDeviceProperty(0,vr::Prop_SupportsXrEyeGazeInteraction_Bool,&property_error))
         snapshot.status_flags|=CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED;
@@ -159,6 +167,23 @@ void observe_frame(bool focused) {
     if (valid && focused) {
         snapshot.status_flags|=CHEEKY_GAZE_STATUS_GAZE_VALID|CHEEKY_GAZE_STATUS_ACTION_ACTIVE;
         for (auto& view:snapshot.views) view.flags|=CHEEKY_GAZE_VIEW_ORIENTATION_VALID;
+    }
+    // Report the scene focus decision separately from input routing and the
+    // runtime's raw eye sample, including while the F8 menu is closed.
+    const std::uint32_t diagnostic_state=
+        (focused ? 1U : 0U) | (input_available ? 2U : 0U) |
+        (menu_exception ? 4U : 0U) | (raw_gaze_valid ? 8U : 0U) |
+        (valid ? 16U : 0U) | (mapped ? 32U : 0U) |
+        (simulate ? 64U : 0U) | (dashboard_visible ? 128U : 0U);
+    if (diagnostic_state!=last_gaze_diagnostic_state || now>=next_gaze_diagnostic_tick) {
+        trace_event("OpenVR gaze state wait=%d pose=%u input=%u dashboard=%u menu_exception=%u raw_gaze=%u projected_gaze=%u mapped=%u simulated=%u flags=0x%X ndc_left=(%.3f,%.3f) ndc_right=(%.3f,%.3f)",
+            static_cast<int>(wait_result),static_cast<unsigned>(pose_valid),
+            static_cast<unsigned>(input_available),static_cast<unsigned>(dashboard_visible),static_cast<unsigned>(menu_exception),
+            static_cast<unsigned>(raw_gaze_valid),static_cast<unsigned>(valid),
+            static_cast<unsigned>(mapped),static_cast<unsigned>(simulate),snapshot.status_flags,
+            ndc[0].v[0],ndc[0].v[1],ndc[1].v[0],ndc[1].v[1]);
+        last_gaze_diagnostic_state=diagnostic_state;
+        next_gaze_diagnostic_tick=now+5000;
     }
 }
 void observe_submit(vr::EVREye eye,const vr::Texture_t* texture,const vr::VRTextureBounds_t* bounds,
@@ -251,7 +276,7 @@ template<unsigned N> struct CompositorHooks {
         ++wait_depth;
         const auto result=wait(self,r,nr,g,ng);
         if (--wait_depth==0) {
-            observe_frame(result==vr::VRCompositorError_None && (!r || nr==0 || r[0].bPoseIsValid));
+            observe_frame(result,!r || nr==0 || r[0].bPoseIsValid);
             if (result == vr::VRCompositorError_None) eye_calibration_frame();
             eye_calibration_tick();
         }

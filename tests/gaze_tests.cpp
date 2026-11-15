@@ -187,6 +187,21 @@ void test_sr_crop_dimensions_during_gaze() {
 }
 
 void test_openvr_menu_focus() {
+    auto scene_focused = [](vr::EVRCompositorError wait_result, bool pose_valid,
+        bool input_available, bool dashboard_visible, bool menu_exception) {
+        return cheeky::openvr_gaze_scene_focused(
+            {wait_result, pose_valid, input_available, dashboard_visible, menu_exception});
+    };
+    expect(scene_focused(vr::VRCompositorError_None, true, false, false, false),
+        "Scene gaze survives unavailable controller input after the menu closes");
+    expect(scene_focused(vr::VRCompositorError_None, true, false, false, true),
+        "Scene gaze remains focused while our menu captures controller input");
+    expect(!scene_focused(vr::VRCompositorError_None, true, true, true, false),
+        "Dashboard suspends gaze even when controller input is available");
+    expect(!scene_focused(vr::VRCompositorError_DoNotHaveFocus, true, false, false, false),
+        "Another scene application suspends gaze");
+    expect(!scene_focused(vr::VRCompositorError_None, false, false, false, false),
+        "Invalid HMD pose suspends gaze");
     struct Overlay {
         bool dashboard{}, visible{true}, found{true};
         std::uint32_t pid{123}, flags{vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible};
@@ -201,20 +216,20 @@ void test_openvr_menu_focus() {
         vr::EVROverlayError GetOverlayFlags(vr::VROverlayHandle_t, std::uint32_t* out) { *out = flags; return vr::VROverlayError_None; }
         vr::EVROverlayError GetOverlayInputMethod(vr::VROverlayHandle_t, vr::VROverlayInputMethod* out) { *out = input; return vr::VROverlayError_None; }
     } overlay;
-    auto allowed = [&] { return cheeky::openvr_menu_allows_gaze(overlay, 123); };
-    expect(allowed(), "Our interactive menu allows gaze during controller capture");
+    auto captures_input = [&] { return cheeky::openvr_menu_captures_input(overlay, 123); };
+    expect(captures_input(), "Our interactive menu is identified during controller capture");
     overlay.dashboard = true;
-    expect(!allowed(), "Dashboard blocks the own-menu gaze exception");
+    expect(!captures_input(), "Dashboard is not identified as our input capture");
     overlay.dashboard = false; overlay.visible = false;
-    expect(!allowed(), "Hidden menu cannot grant gaze focus");
+    expect(!captures_input(), "Hidden menu is not identified as input capture");
     overlay.visible = true; overlay.pid = 456;
-    expect(!allowed(), "Foreign overlay cannot grant gaze focus");
+    expect(!captures_input(), "Foreign overlay is not identified as our input capture");
     overlay.pid = 123; overlay.found = false;
-    expect(!allowed(), "Missing menu cannot grant gaze focus");
+    expect(!captures_input(), "Missing menu is not identified as input capture");
     overlay.found = true; overlay.input = vr::VROverlayInputMethod_None;
-    expect(!allowed(), "Noninteractive menu cannot grant gaze focus");
+    expect(!captures_input(), "Noninteractive menu is not identified as input capture");
     overlay.input = vr::VROverlayInputMethod_Mouse; overlay.flags = 0;
-    expect(!allowed(), "Menu without laser capture cannot grant gaze focus");
+    expect(!captures_input(), "Menu without laser capture is not identified as input capture");
 }
 
 void test_simulated_gaze() {

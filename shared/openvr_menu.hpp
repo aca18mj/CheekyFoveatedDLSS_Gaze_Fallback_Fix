@@ -1,6 +1,7 @@
 #pragma once
 #include "../third_party/openvr/include/openvr.h"
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace cheeky {
@@ -11,17 +12,17 @@ inline std::string openvr_menu_key(std::uint32_t process_id) {
 struct OpenVRGazeFocusState {
     vr::EVRCompositorError wait_result{};
     bool pose_valid{};
-    bool input_available{}; // Diagnostic only: controller routing is independent of gaze.
-    bool dashboard_visible{};
-    bool menu_exception{}; // Diagnostic only: menu capture is independent of gaze.
+    std::optional<bool> dashboard_visible;
+    bool input_available{};
 };
 
 // Controller input can be captured independently of the scene and eye tracker.
-// A successful scene frame and HMD pose establish focus; the dashboard still
-// suspends gaze even if the compositor continues to accept scene frames.
+// Use input availability only when dashboard visibility cannot be queried;
+// otherwise a visible dashboard suspends gaze even if scene frames continue.
 inline bool openvr_gaze_scene_focused(const OpenVRGazeFocusState& state) noexcept {
     return state.wait_result == vr::VRCompositorError_None &&
-        state.pose_valid && !state.dashboard_visible;
+        state.pose_valid &&
+        (state.dashboard_visible.has_value() ? !*state.dashboard_visible : state.input_available);
 }
 
 // Identify Cheeky's visible, interactive menu for diagnostics. Gaze focus is

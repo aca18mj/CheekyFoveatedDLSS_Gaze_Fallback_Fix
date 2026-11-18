@@ -6745,6 +6745,7 @@ DWORD WINAPI interception_worker(void*) noexcept {
            WaitForSingleObject(event, 250U) == WAIT_TIMEOUT) {
         drain_hook_debug_loader_events();
         poll_openvr_hooks();
+        log_openvr_gaze_diagnostics();
         poll_libovr_hooks();
         if(minhook_initialized.load(std::memory_order_acquire)&&
            !reflex_override::attempted.load(std::memory_order_acquire)&&GetModuleHandleW(L"nvapi64.dll")){

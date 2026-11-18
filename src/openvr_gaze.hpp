@@ -5,6 +5,8 @@
 namespace cheeky::foveated_dlss {
 // Called by the existing interception worker, after MinHook initialization.
 void poll_openvr_hooks() noexcept;
+// Emits the latest frame diagnostic from the worker, outside the frame hook.
+void log_openvr_gaze_diagnostics() noexcept;
 // Native hosts can join an already initialized OpenVR session whose compositor
 // the game cached before Cheeky loaded. Never initializes a runtime; disabled
 // for legacy hosts and suppressed when ReShade owns interface selection.

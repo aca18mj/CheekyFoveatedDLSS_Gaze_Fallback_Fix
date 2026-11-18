@@ -40,6 +40,7 @@
 #include <iostream>
 #include <limits>
 #include <filesystem>
+#include <optional>
 
 namespace cheeky::foveated_dlss {
 // The core GPU harness explicitly drives post-submit/reset notifications.
@@ -188,19 +189,25 @@ void test_sr_crop_dimensions_during_gaze() {
 
 void test_openvr_menu_focus() {
     auto scene_focused = [](vr::EVRCompositorError wait_result, bool pose_valid,
-        bool input_available, bool dashboard_visible, bool menu_exception) {
+        std::optional<bool> dashboard_visible, bool input_available) {
         return cheeky::openvr_gaze_scene_focused(
-            {wait_result, pose_valid, input_available, dashboard_visible, menu_exception});
+            {wait_result, pose_valid, dashboard_visible, input_available});
     };
-    expect(scene_focused(vr::VRCompositorError_None, true, false, false, false),
+    expect(scene_focused(vr::VRCompositorError_None, true, false, false),
         "Scene gaze survives unavailable controller input after the menu closes");
-    expect(scene_focused(vr::VRCompositorError_None, true, false, false, true),
+    expect(scene_focused(vr::VRCompositorError_None, true, false, true),
         "Scene gaze remains focused while our menu captures controller input");
-    expect(!scene_focused(vr::VRCompositorError_None, true, true, true, false),
+    expect(!scene_focused(vr::VRCompositorError_None, true, true, true),
         "Dashboard suspends gaze even when controller input is available");
-    expect(!scene_focused(vr::VRCompositorError_DoNotHaveFocus, true, false, false, false),
+    expect(!scene_focused(vr::VRCompositorError_None, true, true, false),
+        "Dashboard suspends gaze when controller input is unavailable");
+    expect(!scene_focused(vr::VRCompositorError_None, true, std::nullopt, false),
+        "Unknown dashboard state cannot bypass unavailable controller input");
+    expect(scene_focused(vr::VRCompositorError_None, true, std::nullopt, true),
+        "Unknown dashboard state preserves the previously accepted input path");
+    expect(!scene_focused(vr::VRCompositorError_DoNotHaveFocus, true, false, false),
         "Another scene application suspends gaze");
-    expect(!scene_focused(vr::VRCompositorError_None, false, false, false, false),
+    expect(!scene_focused(vr::VRCompositorError_None, false, false, false),
         "Invalid HMD pose suspends gaze");
     struct Overlay {
         bool dashboard{}, visible{true}, found{true};

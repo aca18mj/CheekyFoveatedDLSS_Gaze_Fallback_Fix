@@ -48,6 +48,7 @@ bool runtime_stopping{}; // protected by state_mutex
 CheekyGazeSnapshotV1 snapshot{};
 std::uint64_t generation=0x8000000000000001ULL, frame{}, simulation_start{};
 struct GazeDiagnostic {
+    std::uint32_t request{}; // worker request serviced by this capture
     ULONGLONG observed_tick{};
     vr::EVRCompositorError wait_result{};
     bool pose_valid{}, input_available{}, menu_captures_input{};
@@ -57,6 +58,9 @@ struct GazeDiagnostic {
     std::array<vr::HmdVector2_t,2> ndc{};
 };
 GazeDiagnostic gaze_diagnostic{}; // protected by state_mutex; logged by the interception worker
+// Incremented by the worker when a diagnostic line is due. The frame hook
+// captures diagnostics, including the menu overlay probe, only for a new request.
+std::atomic<std::uint32_t> gaze_diagnostic_request{};
 thread_local unsigned wait_depth{};
 thread_local unsigned submit_depth{};
 std::uint32_t pattern{};
@@ -115,8 +119,6 @@ void observe_frame(vr::EVRCompositorError wait_result, bool pose_valid) {
     const bool overlay_ready=overlay && overlay_error==vr::VRInitError_None;
     const std::optional<bool> dashboard_visible=overlay_ready
         ? std::optional<bool>{overlay->IsDashboardVisible()} : std::nullopt;
-    const bool menu_captures_input=!input_available && overlay_ready && !dashboard_visible.value_or(true) &&
-        cheeky::openvr_menu_captures_input(*overlay,GetCurrentProcessId());
     const bool focused=cheeky::openvr_gaze_scene_focused(
         {wait_result,pose_valid,dashboard_visible,input_available});
     if (focused)
@@ -177,10 +179,17 @@ void observe_frame(vr::EVRCompositorError wait_result, bool pose_valid) {
         snapshot.status_flags|=CHEEKY_GAZE_STATUS_GAZE_VALID|CHEEKY_GAZE_STATUS_ACTION_ACTIVE;
         for (auto& view:snapshot.views) view.flags|=CHEEKY_GAZE_VIEW_ORIENTATION_VALID;
     }
-    // Copy only; the worker writes diagnostics without holding the frame lock.
-    gaze_diagnostic={now,wait_result,pose_valid,input_available,menu_captures_input,
-        dashboard_visible,raw_gaze_valid,valid,mapped,simulate,snapshot.status_flags,
-        {ndc[0],ndc[1]}};
+    // Capture only when the worker requests a line. The menu probe is several
+    // overlay calls and affects diagnostics only, so keep it off the per-frame path.
+    const auto diagnostic_request=gaze_diagnostic_request.load(std::memory_order_relaxed);
+    if (diagnostic_request!=gaze_diagnostic.request) {
+        const bool menu_captures_input=!input_available && overlay_ready && !dashboard_visible.value_or(true) &&
+            cheeky::openvr_menu_captures_input(*overlay,GetCurrentProcessId());
+        // Copy only; the worker writes diagnostics without holding the frame lock.
+        gaze_diagnostic={diagnostic_request,now,wait_result,pose_valid,input_available,menu_captures_input,
+            dashboard_visible,raw_gaze_valid,valid,mapped,simulate,snapshot.status_flags,
+            {ndc[0],ndc[1]}};
+    }
 }
 void observe_submit(vr::EVREye eye,const vr::Texture_t* texture,const vr::VRTextureBounds_t* bounds,
     std::uint32_t slice,vr::EVRSubmitFlags flags,vr::EVRCompositorError result) {
@@ -401,15 +410,28 @@ void* interface_hook(const char* version,vr::EVRInitError* error) {
 }
 void log_openvr_gaze_diagnostics() noexcept {
     // Called only by the interception worker. Never flush the log on the frame hook.
-    static ULONGLONG next_log_tick{};
+    static ULONGLONG next_log_tick{}, pending_tick{};
+    static std::uint32_t pending_request{};
     const auto now=GetTickCount64();
-    if (now<next_log_tick) return;
+    if (!pending_request) {
+        if (now<next_log_tick) return;
+        // Ask the next frame for a capture; zero means "no request".
+        do pending_request=gaze_diagnostic_request.fetch_add(1,std::memory_order_relaxed)+1;
+        while (!pending_request);
+        pending_tick=now;
+        return;
+    }
     GazeDiagnostic current;
     {
         std::lock_guard lock(state_mutex);
         current=gaze_diagnostic;
     }
-    if (!current.observed_tick || now-current.observed_tick>1000) return;
+    if (current.request!=pending_request) {
+        // No frame within a second: drop this request and retry next interval.
+        if (now-pending_tick>1000) { pending_request=0; next_log_tick=now+5000; }
+        return;
+    }
+    pending_request=0;
     next_log_tick=now+5000;
     const char* dashboard=current.dashboard_visible
         ? (*current.dashboard_visible ? "visible" : "hidden") : "unknown";
